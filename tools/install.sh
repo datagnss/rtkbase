@@ -395,7 +395,7 @@ detect_gnss() {
           if [[ "$devname" == "bus/"* ]]; then continue; fi
           eval "$(udevadm info -q property --export -p "${syspath}")"
           if [[ -z "$ID_SERIAL" ]]; then continue; fi
-          if [[ "$ID_SERIAL" =~ (u-blox|skytraq|Septentrio) ]]
+          if [[ "$ID_SERIAL" =~ (u-blox|skytraq|Septentrio|[Dd]atagnss) ]]
           then
             detected_gnss[0]=$devname
             detected_gnss[1]=$ID_SERIAL
@@ -406,7 +406,7 @@ detect_gnss() {
           fi
       done
       if [[ ${#detected_gnss[*]} -ne 2 ]]; then
-          vendor_and_product_ids=$(lsusb | grep -i "u-blox\|Septentrio" | grep -Eo "[0-9A-Za-z]+:[0-9A-Za-z]+")
+          vendor_and_product_ids=$(lsusb | grep -i "u-blox\|Septentrio\|Datagnss" | grep -Eo "[0-9A-Za-z]+:[0-9A-Za-z]+")
           if [[ -z "$vendor_and_product_ids" ]]; then 
             echo 'NO USB GNSS RECEIVER DETECTED'
             echo 'YOU CAN REDETECT IT FROM THE WEB UI'
@@ -426,7 +426,7 @@ detect_gnss() {
         systemctl is-active --quiet str2str_tcp.service && sudo systemctl stop str2str_tcp.service && echo 'Stopping str2str_tcp service'
         # TODO remove port if not available in /dev/
         for port in ttyS0 ttyUSB0 ttyUSB1 ttyUSB2 serial0 ttyS1 ttyS2 ttyS3 ttyS4 ttyS5; do
-            for port_speed in 115200 57600 38400 19200 9600; do
+            for port_speed in 230400 115200 57600 38400 19200 9600; do
                 echo 'DETECTION ON ' $port ' at ' $port_speed
                 if [[ $(python3 "${rtkbase_path}"/tools/ubxtool -f /dev/$port -s $port_speed -p MON-VER -w 5 2>/dev/null) =~ 'ZED-F9P' ]]; then
                     detected_gnss[0]=$port
@@ -440,15 +440,27 @@ detect_gnss() {
                     detected_gnss[2]=$port_speed
                     #echo 'Unicore ' "${model}" ' DETECTED ON '$port $port_speed
                     break
+                elif { model=$(python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/$port --baudrate $port_speed --command get_model 2>/dev/null) ; [[ "${model}" == *D10P* ]] ;}; then
+                    detected_gnss[0]=$port
+                    detected_gnss[1]='Datagnss_Nano'
+                    detected_gnss[2]=$port_speed
+                    break
                 fi
                 sleep 0.1
             done
             #exit loop if a receiver is detected
-            [[ ${#detected_gnss[*]} -eq 3 ]] && break
+            [[ ${#detected_gnss[*]} -ge 3 ]] && break
         done
       fi
       # Test if speed is in detected_gnss array. If not, add the default value.
-      [[ ${#detected_gnss[*]} -eq 2 ]] && detected_gnss[2]='115200'
+      if [[ ${#detected_gnss[*]} -eq 2 ]]; then
+        if model=$(python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/"${detected_gnss[0]}" --baudrate 230400 --command get_model 2>/dev/null) && [[ "${model}" == *D10P* ]]; then
+          detected_gnss[1]='Datagnss_Nano'
+          detected_gnss[2]='230400'
+        else
+          detected_gnss[2]='115200'
+        fi
+      fi
       # If /dev/ttyGNSS is a symlink of the detected serial port, switch to ttyGNSS
       [[ '/dev/ttyGNSS' -ef '/dev/'"${detected_gnss[0]}" ]] && detected_gnss[0]='ttyGNSS'
       # Get firmware release
@@ -465,6 +477,9 @@ detect_gnss() {
         then
           #get Unicore UM98X firmware release
           detected_gnss[3]="$(python3 "${rtkbase_path}"/tools/unicore_tool.py --port /dev/"${detected_gnss[0]}" --baudrate ${detected_gnss[2]} --command get_firmware 2>/dev/null)" || firmware='?'
+      elif [[ "${detected_gnss[1]}" =~ 'Datagnss' ]]
+        then
+          detected_gnss[3]="$(python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/"${detected_gnss[0]}" --baudrate ${detected_gnss[2]} --command get_firmware 2>/dev/null)" || detected_gnss[3]='?'
       fi
       # "send" result
       echo '/dev/'"${detected_gnss[0]}" ' - ' "${detected_gnss[1]}"' - ' "${detected_gnss[2]}"' - ' "${detected_gnss[3]}"
@@ -484,6 +499,12 @@ detect_gnss() {
             sudo -u "${RTKBASE_USER}" sed -i s/^com_port=.*/com_port=\'${detected_gnss[0]}\'/ "${rtkbase_path}"/settings.conf
             sudo -u "${RTKBASE_USER}" sed -i s/^com_port_settings=.*/com_port_settings=\'${detected_gnss[2]}:8:n:1\'/ "${rtkbase_path}"/settings.conf
             sudo -u "${RTKBASE_USER}" sed -i s/^receiver_firmware=.*/receiver_firmware=\'"${detected_gnss[3]}"\'/ "${rtkbase_path}"/settings.conf            
+            if [[ "${detected_gnss[1]}" =~ 'Datagnss' ]]
+            then
+              sudo -u "${RTKBASE_USER}" sed -i s/^receiver=.*/receiver=\'Datagnss_Nano\'/ "${rtkbase_path}"/settings.conf
+              sudo -u "${RTKBASE_USER}" sed -i s/^receiver_format=.*/receiver_format=\'rtcm3\'/ "${rtkbase_path}"/settings.conf
+              sudo -u "${RTKBASE_USER}" sed -i s/^receiver_carrier=.*/receiver_carrier=\'L1+L5\'/ "${rtkbase_path}"/settings.conf
+            fi
           else
             echo 'settings.conf is missing'
             return 1
@@ -593,6 +614,23 @@ configure_gnss(){
             else
               echo 'Failed to configure the Gnss receiver'
               return 1
+          fi
+        elif { model=$(python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/${com_port} --baudrate ${com_port_settings%%:*} --command get_model 2>/dev/null) ; [[ "${model}" == *D10P* ]] ;}
+          then
+          firmware="$(python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/${com_port} --baudrate ${com_port_settings%%:*} --command get_firmware 2>/dev/null)" || firmware='?'
+          echo 'Datagnss Nano Firmware: ' "${firmware}"
+          python3 "${rtkbase_path}"/tools/datagnss_tool.py --port /dev/${com_port} --baudrate ${com_port_settings%%:*} --command send_config_file "${rtkbase_path}"/receiver_cfg/NANO_RTK_Receiver_Pro.cfg --store
+          if [[ $? -eq  0 ]]
+          then
+            echo 'Datagnss Nano successfully configured'
+            sudo -u "${RTKBASE_USER}" sed -i s/^receiver_firmware=.*/receiver_firmware=\'${firmware}\'/ "${rtkbase_path}"/settings.conf                                    && \
+            sudo -u "${RTKBASE_USER}" sed -i s/^com_port_settings=.*/com_port_settings=\'230400:8:n:1\'/ "${rtkbase_path}"/settings.conf                               && \
+            sudo -u "${RTKBASE_USER}" sed -i s/^receiver=.*/receiver=\'Datagnss_Nano\'/ "${rtkbase_path}"/settings.conf                                                && \
+            sudo -u "${RTKBASE_USER}" sed -i s/^receiver_format=.*/receiver_format=\'rtcm3\'/ "${rtkbase_path}"/settings.conf
+            return $?
+          else
+            echo 'Failed to configure the Gnss receiver'
+            return 1
           fi
 
         else
